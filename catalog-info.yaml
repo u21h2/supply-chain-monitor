@@ -12,7 +12,7 @@ metadata:
 
 spec:
   type: buildkite-pipeline
-  owner: group:trade-admins
+  owner: group:protections-leads
   system: buildkite
   implementation:
     apiVersion: buildkite.elastic.dev/v1
