@@ -60,7 +60,8 @@ pip install -r requirements-dev.txt
 ### Prerequisites
 
 - Python 3.9+
-- [Cursor Agent CLI](https://cursor.com/docs/cli/overview) (for LLM analysis features)
+- An OpenAI-compatible Chat Completions API for the default LLM analysis path
+- [Cursor Agent CLI](https://cursor.com/docs/cli/overview) (optional, for the alternate LLM backend)
 - A Slack workspace and bot token (optional, for alert testing)
 
 ## Testing
@@ -72,11 +73,14 @@ ruff check .
 # Run type checking (on Linux/macOS shells; on PowerShell list files explicitly)
 mypy --ignore-missing-imports monitor.py analyze_diff.py package_diff.py pypi_monitor.py slack.py top_pypi_packages.py
 
+# Run the unit tests (uses a mocked OpenAI-compatible API)
+python -m unittest discover -s tests
+
 # Run a one-shot scan to verify basic functionality
 python monitor.py --once --no-npm
 ```
 
-There is no formal test suite yet — contributions to add one are very welcome!
+The test suite mocks the OpenAI-compatible API, so it does not require real API credentials.
 
 ## Code Style
 

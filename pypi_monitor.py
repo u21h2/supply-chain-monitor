@@ -24,6 +24,7 @@ import time
 import urllib.request
 import xmlrpc.client
 from datetime import datetime, timezone
+from typing import cast
 
 PYPI_XMLRPC = "https://pypi.org/pypi"
 TOP_PACKAGES_URL = (
@@ -31,6 +32,7 @@ TOP_PACKAGES_URL = (
 )
 
 RELEASE_ACTIONS = {"new release", "add source file", "add py2 file", "add py3 file"}
+PyPIEvent = tuple[str, str, int, str, int]
 
 
 def load_watchlist(top_n: int) -> set[str]:
@@ -46,12 +48,22 @@ def get_client() -> xmlrpc.client.ServerProxy:
     return xmlrpc.client.ServerProxy(PYPI_XMLRPC)
 
 
+def _pypi_last_serial(client: xmlrpc.client.ServerProxy) -> int:
+    return cast(int, client.changelog_last_serial())
+
+
+def _pypi_events_since(
+    client: xmlrpc.client.ServerProxy, since_serial: int
+) -> list[PyPIEvent]:
+    return cast(list[PyPIEvent], client.changelog_since_serial(since_serial))
+
+
 def fmt_time(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def check_updates(client, since_serial: int, watchlist: set[str]) -> int:
-    events = client.changelog_since_serial(since_serial)
+    events = _pypi_events_since(client, since_serial)
     if not events:
         return since_serial
 
@@ -77,12 +89,12 @@ def check_updates(client, since_serial: int, watchlist: set[str]) -> int:
 
 def run_once(client, watchlist: set[str], lookback_seconds: int = 600):
     """Single check: get events from the last `lookback_seconds`."""
-    current_serial = client.changelog_last_serial()
+    current_serial = _pypi_last_serial(client)
     # Estimate a serial from ~lookback_seconds ago. PyPI averages ~5-10 events/sec.
     estimated_start = max(0, current_serial - lookback_seconds * 15)
 
     print(f"[*] Checking events from serial {estimated_start:,} to {current_serial:,} (~last {lookback_seconds // 60} min)...")
-    events = client.changelog_since_serial(estimated_start)
+    events = _pypi_events_since(client, estimated_start)
 
     if not events:
         print("[+] No events found.")
@@ -112,7 +124,7 @@ def run_once(client, watchlist: set[str], lookback_seconds: int = 600):
 
 def monitor(watchlist: set[str], interval: int):
     client = get_client()
-    serial = client.changelog_last_serial()
+    serial = _pypi_last_serial(client)
     print(f"[*] Starting serial: {serial:,}")
     print(f"[*] Polling every {interval}s. Press Ctrl+C to stop.\n")
 

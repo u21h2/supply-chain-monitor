@@ -7,7 +7,7 @@ import traceback
 import time
 import os
 
-import requests
+import requests  # type: ignore[import-untyped]
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 

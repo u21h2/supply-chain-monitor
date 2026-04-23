@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Automated monitoring of the top **PyPI** and **npm** packages for supply chain compromise. Polls both registries for new releases, diffs each release against its predecessor, and uses an LLM (via [Cursor Agent CLI](https://cursor.com/docs/cli/overview)) to classify diffs as **benign** or **malicious**. Malicious findings trigger a Slack alert.
+Automated monitoring of the top **PyPI** and **npm** packages for supply chain compromise. Polls both registries for new releases, diffs each release against its predecessor, and uses an LLM to classify diffs as **benign** or **malicious**. By default it calls an OpenAI-compatible Chat Completions API; Cursor Agent CLI remains available as an optional backend. Malicious findings trigger a Slack alert.
 
 Both ecosystems are monitored by default. Use `--no-pypi` or `--no-npm` to disable one.
 
@@ -39,8 +39,8 @@ Each ecosystem runs its own polling thread but shares the analysis and alerting 
                                    └───────┬───────┘
                                            ▼
                                    ┌───────────────┐  ◄── LLM analysis
-                                   │ Cursor Agent  │      (read-only)
-                                   │ CLI (ask mode)│
+                                   │ OpenAI-compat │      (default)
+                                   │ or Cursor CLI │
                                    └───────┬───────┘
                                            │
                                        verdict?
@@ -67,9 +67,30 @@ The LLM analysis is prompted to look for:
 ## Prerequisites
 
 - **Python 3.9+** — install runtime dependencies with `pip install -r requirements.txt` (stdlib covers most of the tool; `requests` is used for Slack uploads)
-- **Cursor Agent CLI** — the standalone `agent` binary, not the IDE
+- **An LLM backend**
+  - Default: an OpenAI-compatible Chat Completions API
+  - Optional: [Cursor Agent CLI](https://cursor.com/docs/cli/overview)
 
-### Installing Cursor Agent CLI
+### OpenAI-Compatible Configuration
+
+Set these environment variables before running the monitor:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-4.1-mini"
+# Optional when using a non-OpenAI provider or local gateway:
+export OPENAI_BASE_URL="https://your-endpoint.example/v1"
+```
+
+Supported aliases:
+
+- `SCM_OPENAI_API_KEY`
+- `SCM_OPENAI_MODEL`
+- `SCM_OPENAI_BASE_URL`
+
+If `OPENAI_BASE_URL` is omitted, the tool uses `https://api.openai.com/v1`.
+
+### Installing Cursor Agent CLI (Optional)
 
 **Windows (PowerShell):**
 ```powershell
@@ -86,7 +107,7 @@ Verify with:
 agent --version
 ```
 
-You must be authenticated with Cursor (`agent login` or set `CURSOR_API_KEY`).
+You must be authenticated with Cursor (`agent login` or set `CURSOR_API_KEY`) if you choose `--llm-backend cursor`.
 
 ### Slack Configuration
 
@@ -105,6 +126,10 @@ The bot needs `chat:write` scope on the target channel. The `channel` field is t
 ## Quick Start
 
 ```bash
+# Configure the default OpenAI-compatible backend
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-4.1-mini"
+
 # One-shot: analyze releases from the last ~10 minutes
 python monitor.py --once
 
@@ -128,7 +153,7 @@ python monitor.py --no-npm
 | `monitor.py` | **Main orchestrator** — poll PyPI + npm, diff, analyze, alert (parallel threads) |
 | `pypi_monitor.py` | Standalone PyPI changelog poller (used for exploration) |
 | `package_diff.py` | Download and diff two versions of any PyPI or npm package |
-| `analyze_diff.py` | Send a diff to Cursor Agent CLI, parse verdict |
+| `analyze_diff.py` | Send a diff to the selected LLM backend, parse verdict |
 | `top_pypi_packages.py` | Fetch and list top N PyPI packages by download count |
 | `slack.py` | Slack API client (SendMessage, PostFile) |
 | `etc/slack.json` | Slack bot credentials |
@@ -147,7 +172,8 @@ Options:
   --interval SECS  Poll interval in seconds (default: 300)
   --once           Single pass over recent events, then exit
   --slack          Enable Slack alerts for malicious findings
-  --model MODEL    Override LLM model (default: composer-2-fast)
+  --llm-backend    LLM backend for diff analysis (default: openai)
+  --model MODEL    Override LLM model for the selected backend
   --debug          Enable DEBUG logging (includes agent raw output)
 
 PyPI options:
@@ -209,11 +235,14 @@ python analyze_diff.py telnyx_diff.md
 # JSON output
 python analyze_diff.py telnyx_diff.md --json
 
-# Use a specific model
-python analyze_diff.py telnyx_diff.md --model claude-4-opus
+# Use a specific OpenAI-compatible model
+python analyze_diff.py telnyx_diff.md --model gpt-4.1-mini
+
+# Use Cursor instead
+python analyze_diff.py telnyx_diff.md --backend cursor --model claude-4-opus
 ```
 
-Runs Cursor Agent CLI in `--mode ask` (read-only) with `--trust`. The agent reads the diff file and returns a structured verdict.
+By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode.
 
 Exit codes: `0` = benign, `1` = malicious, `2` = unknown/error.
 
@@ -292,8 +321,9 @@ Analysis summary (truncated):
 ## Limitations
 
 - Releases are analyzed sequentially within each ecosystem thread. During high release volume, there will be a processing backlog.
-- **Cursor Agent CLI required** — analysis depends on an active Cursor subscription and the `agent` CLI being authenticated.
-- **Sandbox mode** (filesystem isolation) is only available on macOS/Linux. On Windows, the agent runs in read-only `ask` mode but without OS-level sandboxing.
+- **LLM access required** — the default backend needs a reachable OpenAI-compatible endpoint and valid credentials. Cursor is optional, not required.
+- **Large diffs may be truncated** before being sent to an OpenAI-compatible API. Adjust `SCM_DIFF_CHAR_LIMIT` if your model supports larger contexts.
+- **Cursor sandbox mode** (filesystem isolation) is only available on macOS/Linux. On Windows, the agent runs in read-only `ask` mode but without OS-level sandboxing.
 - **Watchlists are static** — loaded once at startup from the hugovk (PyPI) and download-counts (npm) datasets. Restart to refresh.
 - **npm _changes gap protection** — if the saved npm sequence falls more than 10,000 changes behind the registry head, the monitor resets to head to avoid a long catch-up. Releases during the gap are missed.
 

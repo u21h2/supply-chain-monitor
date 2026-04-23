@@ -5,8 +5,9 @@
 Supply chain monitor for top PyPI and npm packages.
 
 Polls PyPI and npm for new releases of the top N packages, diffs each new
-release against its previous version, analyzes the diff with Cursor Agent
-for signs of compromise, and alerts Slack if anything malicious is found.
+release against its previous version, analyzes the diff with the configured
+LLM backend for signs of compromise, and alerts Slack if anything malicious
+is found.
 
 Both ecosystems are monitored by default. Use --no-pypi or --no-npm to
 disable one.
@@ -17,6 +18,7 @@ Usage:
     python monitor.py --interval 120           # poll every 2 min
     python monitor.py --once                    # one-shot scan (no Slack by default)
     python monitor.py --slack                    # continuous, with Slack alerts
+    python monitor.py --llm-backend cursor      # use Cursor instead of OpenAI-compatible API
     python monitor.py --no-npm                 # PyPI only
     python monitor.py --no-pypi               # npm only
     python monitor.py --no-pypi --npm-top 5000 # npm only, top 5000
@@ -37,8 +39,9 @@ import urllib.request
 import xmlrpc.client
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
-from analyze_diff import parse_verdict, run_cursor_agent
+from analyze_diff import parse_verdict, run_diff_analysis
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -77,6 +80,7 @@ NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
 NPM_MAX_CHANGES_PER_CYCLE = 10000
 
 _state_lock = threading.Lock()
+PyPIEvent = tuple[str, str, int, str, int]
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,16 @@ def load_watchlist(top_n: int) -> dict[str, int]:
         data["last_update"],
     )
     return watchlist
+
+
+def _pypi_last_serial(client: xmlrpc.client.ServerProxy) -> int:
+    return cast(int, client.changelog_last_serial())
+
+
+def _pypi_events_since(
+    client: xmlrpc.client.ServerProxy, since_serial: int
+) -> list[PyPIEvent]:
+    return cast(list[PyPIEvent], client.changelog_since_serial(since_serial))
 
 
 def get_previous_version(package: str, new_version: str) -> str | None:
@@ -246,16 +260,17 @@ def analyze_report(
     package: str,
     new_version: str,
     *,
+    backend: str | None = None,
     model: str | None = None,
 ) -> tuple[str, str]:
-    """Write report to a temp workspace, run Cursor Agent, return (verdict, analysis)."""
+    """Write report to a temp workspace, run the analyzer, return (verdict, analysis)."""
     safe_name = package.replace("/", "_").replace("@", "")
     workspace = Path(tempfile.mkdtemp(prefix=f"scm_analyze_{safe_name}_"))
     diff_file = workspace / f"{safe_name}_diff.md"
     diff_file.write_text(report, encoding="utf-8")
     log.info("Diff written to %s", diff_file)
     try:
-        raw_output = run_cursor_agent(diff_file, model=model or "composer-2-fast")
+        raw_output = run_diff_analysis(diff_file, backend=backend, model=model)
         verdict, analysis = parse_verdict(raw_output)
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
@@ -515,6 +530,7 @@ def process_npm_release(
     rank: int,
     slack: bool = False,
     *,
+    backend: str | None = None,
     model: str | None = None,
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
@@ -532,7 +548,13 @@ def process_npm_release(
 
     try:
         log.info("[npm] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(
+            report,
+            package,
+            new_version,
+            backend=backend,
+            model=model,
+        )
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -551,7 +573,9 @@ def process_npm_release(
 # Core loop — PyPI
 # ---------------------------------------------------------------------------
 
-def extract_new_releases(events: list, watchlist: dict[str, int]) -> list[tuple[str, str, int]]:
+def extract_new_releases(
+    events: list[PyPIEvent], watchlist: dict[str, int]
+) -> list[tuple[str, str, int]]:
     """Return deduplicated [(package, version, timestamp)] for 'new release' events in the watchlist."""
     seen = set()
     releases = []
@@ -573,6 +597,7 @@ def process_release(
     rank: int,
     slack: bool = False,
     *,
+    backend: str | None = None,
     model: str | None = None,
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
@@ -590,7 +615,13 @@ def process_release(
 
     try:
         log.info("[pypi] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(
+            report,
+            package,
+            new_version,
+            backend=backend,
+            model=model,
+        )
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -609,6 +640,7 @@ def poll_loop(
     *,
     initial_serial: int | None = None,
     state_path: Path | None = None,
+    backend: str | None = None,
     model: str | None = None,
 ):
     state_path = state_path or LAST_SERIAL_PATH
@@ -627,7 +659,7 @@ def poll_loop(
                 interval,
             )
         else:
-            serial = client.changelog_last_serial()
+            serial = _pypi_last_serial(client)
             log.info(
                 "[pypi] Starting serial: %s (PyPI head, no %s) — polling every %ss",
                 f"{serial:,}",
@@ -641,7 +673,7 @@ def poll_loop(
     try:
         while True:
             try:
-                events = client.changelog_since_serial(serial)
+                events = _pypi_events_since(client, serial)
             except Exception:
                 log.error("[pypi] Failed to fetch changelog:\n%s", traceback.format_exc())
                 time.sleep(interval)
@@ -663,7 +695,12 @@ def poll_loop(
             for package, version, ts in releases:
                 rank = watchlist.get(package.lower(), 0)
                 verdict = process_release(
-                    package, version, rank, slack=slack, model=model,
+                    package,
+                    version,
+                    rank,
+                    slack=slack,
+                    backend=backend,
+                    model=model,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -683,10 +720,11 @@ def run_once(
     lookback_seconds: int = 600,
     *,
     since_serial: int | None = None,
+    backend: str | None = None,
     model: str | None = None,
 ):
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
-    current_serial = client.changelog_last_serial()
+    current_serial = _pypi_last_serial(client)
     if since_serial is not None:
         estimated_start = max(0, since_serial)
         log.info(
@@ -698,7 +736,7 @@ def run_once(
         log.info("[pypi] One-shot: checking events from serial %s to %s (~last %s min)",
                  f"{estimated_start:,}", f"{current_serial:,}", lookback_seconds // 60)
 
-    events = client.changelog_since_serial(estimated_start)
+    events = _pypi_events_since(client, estimated_start)
     if not events:
         log.info("[pypi] No events found.")
         return
@@ -708,7 +746,14 @@ def run_once(
 
     for package, version, ts in releases:
         rank = watchlist.get(package.lower(), 0)
-        process_release(package, version, rank, slack=slack, model=model)
+        process_release(
+            package,
+            version,
+            rank,
+            slack=slack,
+            backend=backend,
+            model=model,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +767,7 @@ def npm_poll_loop(
     *,
     initial_seq: int | None = None,
     state_path: Path | None = None,
+    backend: str | None = None,
     model: str | None = None,
 ):
     state_path = state_path or LAST_SERIAL_PATH
@@ -801,7 +847,12 @@ def npm_poll_loop(
             for pkg, version in releases:
                 rank = watchlist.get(pkg.lower(), 0)
                 verdict = process_npm_release(
-                    pkg, version, rank, slack=slack, model=model,
+                    pkg,
+                    version,
+                    rank,
+                    slack=slack,
+                    backend=backend,
+                    model=model,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -820,6 +871,7 @@ def npm_run_once(
     slack: bool = False,
     lookback_seconds: int = 600,
     *,
+    backend: str | None = None,
     model: str | None = None,
 ):
     """One-shot: check for npm releases published in the last *lookback_seconds*."""
@@ -858,7 +910,14 @@ def npm_run_once(
 
     for pkg, version in releases:
         rank = watchlist.get(pkg.lower(), 0)
-        process_npm_release(pkg, version, rank, slack=slack, model=model)
+        process_npm_release(
+            pkg,
+            version,
+            rank,
+            slack=slack,
+            backend=backend,
+            model=model,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +930,13 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds (default: 300)")
     parser.add_argument("--once", action="store_true", help="Single pass over recent events, then exit")
     parser.add_argument("--slack", action="store_true", help="Enable Slack alerts for malicious findings")
-    parser.add_argument("--model", help="Override model for Cursor Agent analysis")
+    parser.add_argument(
+        "--llm-backend",
+        choices=("openai", "cursor"),
+        default="openai",
+        help="LLM backend for diff analysis (default: openai)",
+    )
+    parser.add_argument("--model", help="Override model for the selected LLM backend")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes agent raw output)")
 
     pypi_group = parser.add_argument_group("PyPI options")
@@ -904,12 +969,18 @@ def main():
                 pypi_watchlist,
                 slack=args.slack,
                 since_serial=args.serial,
+                backend=args.llm_backend,
                 model=args.model,
             )
         if enable_npm:
             npm_top = args.npm_top or args.top
             npm_watchlist = load_npm_watchlist(npm_top)
-            npm_run_once(npm_watchlist, slack=args.slack, model=args.model)
+            npm_run_once(
+                npm_watchlist,
+                slack=args.slack,
+                backend=args.llm_backend,
+                model=args.model,
+            )
     else:
         threads: list[threading.Thread] = []
 
@@ -921,6 +992,7 @@ def main():
                 kwargs={
                     "slack": args.slack,
                     "initial_serial": args.serial,
+                    "backend": args.llm_backend,
                     "model": args.model,
                 },
                 daemon=True,
@@ -937,6 +1009,7 @@ def main():
                 kwargs={
                     "slack": args.slack,
                     "initial_seq": args.npm_seq,
+                    "backend": args.llm_backend,
                     "model": args.model,
                 },
                 daemon=True,
