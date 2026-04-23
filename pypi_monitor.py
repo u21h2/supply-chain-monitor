@@ -28,7 +28,7 @@ from typing import cast
 
 PYPI_XMLRPC = "https://pypi.org/pypi"
 TOP_PACKAGES_URL = (
-    "https://hugovk.github.io/top-pypi-packages/top-pypi-packages-30-days.min.json"
+    "https://hugovk.dev/top-pypi-packages/top-pypi-packages.min.json"
 )
 
 RELEASE_ACTIONS = {"new release", "add source file", "add py2 file", "add py3 file"}

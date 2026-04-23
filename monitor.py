@@ -54,7 +54,9 @@ from slack import Slack
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"monitor_{datetime.now().strftime('%Y%m%d')}.log"
+LOG_DAY = datetime.now().strftime("%Y%m%d")
+LOG_FILE = LOG_DIR / f"monitor_{LOG_DAY}.log"
+ACTIVITY_LOG_FILE = LOG_DIR / f"activity_{LOG_DAY}.jsonl"
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -70,7 +72,7 @@ log = logging.getLogger("monitor")
 PYPI_XMLRPC = "https://pypi.org/pypi"
 PYPI_JSON = "https://pypi.org/pypi/{package}/json"
 TOP_PACKAGES_URL = (
-    "https://hugovk.github.io/top-pypi-packages/top-pypi-packages-30-days.min.json"
+    "https://hugovk.dev/top-pypi-packages/top-pypi-packages.min.json"
 )
 LAST_SERIAL_PATH = Path(__file__).resolve().parent / "last_serial.yaml"
 
@@ -80,6 +82,7 @@ NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
 NPM_MAX_CHANGES_PER_CYCLE = 10000
 
 _state_lock = threading.Lock()
+_activity_log_lock = threading.Lock()
 PyPIEvent = tuple[str, str, int, str, int]
 
 
@@ -152,6 +155,28 @@ def load_watchlist(top_n: int) -> dict[str, int]:
         data["last_update"],
     )
     return watchlist
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _analysis_excerpt(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n[... truncated in activity log ...]"
+
+
+def write_activity_event(event_type: str, **fields: object) -> None:
+    """Append a structured JSONL activity record for later auditing."""
+    record = {"ts": _utc_now_iso(), "event": event_type, **fields}
+    try:
+        with _activity_log_lock:
+            with ACTIVITY_LOG_FILE.open("a", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, sort_keys=True, default=str)
+                f.write("\n")
+    except Exception:
+        log.error("Failed to write activity log:\n%s", traceback.format_exc())
 
 
 def _pypi_last_serial(client: xmlrpc.client.ServerProxy) -> int:
@@ -535,19 +560,53 @@ def process_npm_release(
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
     log.info("[npm] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
+    write_activity_event(
+        "release_processing_started",
+        ecosystem="npm",
+        package=package,
+        version=new_version,
+        rank=rank,
+    )
 
     old_version = npm_get_previous_version(package, new_version)
     if not old_version:
         log.warning("[npm] No previous version found for %s, skipping diff", package)
+        write_activity_event(
+            "release_processing_skipped",
+            ecosystem="npm",
+            package=package,
+            version=new_version,
+            rank=rank,
+            reason="no_previous_version",
+        )
         return "skipped"
 
     log.info("[npm] Diffing %s %s -> %s", package, old_version, new_version)
     report, tmp_dir = npm_diff_package(package, old_version, new_version)
     if not report:
+        write_activity_event(
+            "release_processing_error",
+            ecosystem="npm",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            reason="diff_failed",
+        )
         return "error"
 
     try:
         log.info("[npm] Analyzing diff for %s...", package)
+        write_activity_event(
+            "analysis_started",
+            ecosystem="npm",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            backend=backend or "default",
+            model=model or "default",
+        )
         verdict, analysis = analyze_report(
             report,
             package,
@@ -556,6 +615,18 @@ def process_npm_release(
             model=model,
         )
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
+        write_activity_event(
+            "analysis_completed",
+            ecosystem="npm",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            backend=backend or "default",
+            model=model or "default",
+            verdict=verdict,
+            analysis=_analysis_excerpt(analysis),
+        )
 
         if verdict == "malicious":
             send_slack_alert(
@@ -602,19 +673,53 @@ def process_release(
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
     log.info("[pypi] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
+    write_activity_event(
+        "release_processing_started",
+        ecosystem="pypi",
+        package=package,
+        version=new_version,
+        rank=rank,
+    )
 
     old_version = get_previous_version(package, new_version)
     if not old_version:
         log.warning("[pypi] No previous version found for %s, skipping diff", package)
+        write_activity_event(
+            "release_processing_skipped",
+            ecosystem="pypi",
+            package=package,
+            version=new_version,
+            rank=rank,
+            reason="no_previous_version",
+        )
         return "skipped"
 
     log.info("[pypi] Diffing %s %s -> %s", package, old_version, new_version)
     report, tmp_dir = diff_package(package, old_version, new_version)
     if not report:
+        write_activity_event(
+            "release_processing_error",
+            ecosystem="pypi",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            reason="diff_failed",
+        )
         return "error"
 
     try:
         log.info("[pypi] Analyzing diff for %s...", package)
+        write_activity_event(
+            "analysis_started",
+            ecosystem="pypi",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            backend=backend or "default",
+            model=model or "default",
+        )
         verdict, analysis = analyze_report(
             report,
             package,
@@ -623,6 +728,18 @@ def process_release(
             model=model,
         )
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
+        write_activity_event(
+            "analysis_completed",
+            ecosystem="pypi",
+            package=package,
+            old_version=old_version,
+            version=new_version,
+            rank=rank,
+            backend=backend or "default",
+            model=model or "default",
+            verdict=verdict,
+            analysis=_analysis_excerpt(analysis),
+        )
 
         if verdict == "malicious":
             send_slack_alert(package, new_version, rank, verdict, analysis, slack=slack)
@@ -667,24 +784,64 @@ def poll_loop(
                 interval,
             )
     save_last_serial(serial, state_path)
+    write_activity_event(
+        "poll_loop_started",
+        ecosystem="pypi",
+        mode="continuous",
+        interval_seconds=interval,
+        serial=serial,
+        backend=backend or "default",
+        model=model or "default",
+    )
 
     stats = {"checked": 0, "benign": 0, "malicious": 0, "error": 0, "skipped": 0}
 
     try:
         while True:
+            write_activity_event(
+                "poll_cycle_started",
+                ecosystem="pypi",
+                mode="continuous",
+                serial=serial,
+            )
             try:
                 events = _pypi_events_since(client, serial)
             except Exception:
                 log.error("[pypi] Failed to fetch changelog:\n%s", traceback.format_exc())
+                write_activity_event(
+                    "poll_cycle_error",
+                    ecosystem="pypi",
+                    mode="continuous",
+                    serial=serial,
+                    error=traceback.format_exc(),
+                )
                 time.sleep(interval)
                 continue
 
             if not events:
+                write_activity_event(
+                    "poll_cycle_completed",
+                    ecosystem="pypi",
+                    mode="continuous",
+                    previous_serial=serial,
+                    next_serial=serial,
+                    event_count=0,
+                    release_count=0,
+                )
                 time.sleep(interval)
                 continue
 
             new_serial = max(e[4] for e in events)
             releases = extract_new_releases(events, watchlist)
+            write_activity_event(
+                "poll_cycle_completed",
+                ecosystem="pypi",
+                mode="continuous",
+                previous_serial=serial,
+                next_serial=new_serial,
+                event_count=len(events),
+                release_count=len(releases),
+            )
 
             if releases:
                 log.info(
@@ -712,6 +869,13 @@ def poll_loop(
 
     except KeyboardInterrupt:
         log.info("[pypi] Stopped. Last serial: %s | Stats: %s", f"{serial:,}", stats)
+        write_activity_event(
+            "poll_loop_stopped",
+            ecosystem="pypi",
+            mode="continuous",
+            serial=serial,
+            stats=stats,
+        )
 
 
 def run_once(
@@ -735,14 +899,42 @@ def run_once(
         estimated_start = max(0, current_serial - lookback_seconds * 15)
         log.info("[pypi] One-shot: checking events from serial %s to %s (~last %s min)",
                  f"{estimated_start:,}", f"{current_serial:,}", lookback_seconds // 60)
+    write_activity_event(
+        "poll_run_started",
+        ecosystem="pypi",
+        mode="once",
+        start_serial=estimated_start,
+        end_serial=current_serial,
+        lookback_seconds=lookback_seconds,
+        backend=backend or "default",
+        model=model or "default",
+    )
 
     events = _pypi_events_since(client, estimated_start)
     if not events:
         log.info("[pypi] No events found.")
+        write_activity_event(
+            "poll_run_completed",
+            ecosystem="pypi",
+            mode="once",
+            start_serial=estimated_start,
+            end_serial=current_serial,
+            event_count=0,
+            release_count=0,
+        )
         return
 
     releases = extract_new_releases(events, watchlist)
     log.info("[pypi] %s new watchlist releases in window", len(releases))
+    write_activity_event(
+        "poll_run_completed",
+        ecosystem="pypi",
+        mode="once",
+        start_serial=estimated_start,
+        end_serial=current_serial,
+        event_count=len(events),
+        release_count=len(releases),
+    )
 
     for package, version, ts in releases:
         rank = watchlist.get(package.lower(), 0)
@@ -803,11 +995,28 @@ def npm_poll_loop(
             )
 
     save_npm_state(seq, poll_epoch, state_path)
+    write_activity_event(
+        "poll_loop_started",
+        ecosystem="npm",
+        mode="continuous",
+        interval_seconds=interval,
+        seq=seq,
+        poll_epoch=poll_epoch,
+        backend=backend or "default",
+        model=model or "default",
+    )
     stats = {"checked": 0, "benign": 0, "malicious": 0, "error": 0, "skipped": 0}
 
     try:
         while True:
             cycle_start = time.time()
+            write_activity_event(
+                "poll_cycle_started",
+                ecosystem="npm",
+                mode="continuous",
+                seq=seq,
+                poll_epoch=poll_epoch,
+            )
 
             try:
                 changed_packages: set[str] = set()
@@ -826,6 +1035,13 @@ def npm_poll_loop(
                 seq = current_seq
             except Exception:
                 log.error("[npm] Failed to fetch changes:\n%s", traceback.format_exc())
+                write_activity_event(
+                    "poll_cycle_error",
+                    ecosystem="npm",
+                    mode="continuous",
+                    seq=seq,
+                    error=traceback.format_exc(),
+                )
                 time.sleep(interval)
                 continue
 
@@ -837,6 +1053,23 @@ def npm_poll_loop(
                         releases.append((pkg, ver))
                 except Exception:
                     log.error("[npm] Error checking %s:\n%s", pkg, traceback.format_exc())
+                    write_activity_event(
+                        "release_check_error",
+                        ecosystem="npm",
+                        package=pkg,
+                        seq=seq,
+                        error=traceback.format_exc(),
+                    )
+
+            write_activity_event(
+                "poll_cycle_completed",
+                ecosystem="npm",
+                mode="continuous",
+                seq=seq,
+                fetched_change_count=total_fetched,
+                changed_package_count=len(changed_packages),
+                release_count=len(releases),
+            )
 
             if releases:
                 log.info(
@@ -864,6 +1097,13 @@ def npm_poll_loop(
 
     except KeyboardInterrupt:
         log.info("[npm] Stopped. Last seq: %s | Stats: %s", f"{seq:,}", stats)
+        write_activity_event(
+            "poll_loop_stopped",
+            ecosystem="npm",
+            mode="continuous",
+            seq=seq,
+            stats=stats,
+        )
 
 
 def npm_run_once(
@@ -883,11 +1123,23 @@ def npm_run_once(
         "[npm] One-shot: checking changes from seq %s to %s (~last %d min)",
         f"{estimated_start:,}", f"{current_seq:,}", lookback_seconds // 60,
     )
+    write_activity_event(
+        "poll_run_started",
+        ecosystem="npm",
+        mode="once",
+        start_seq=estimated_start,
+        end_seq=current_seq,
+        lookback_seconds=lookback_seconds,
+        backend=backend or "default",
+        model=model or "default",
+    )
 
     changed_packages: set[str] = set()
     seq = estimated_start
+    total_fetched = 0
     while True:
         results, new_seq = npm_poll_changes(seq)
+        total_fetched += len(results)
         for r in results:
             pkg_id = r.get("id", "")
             if not pkg_id.startswith("_design/") and pkg_id.lower() in watchlist:
@@ -905,8 +1157,25 @@ def npm_run_once(
             releases.extend((pkg, ver) for ver in new_versions)
         except Exception:
             log.error("[npm] Error checking %s:\n%s", pkg, traceback.format_exc())
+            write_activity_event(
+                "release_check_error",
+                ecosystem="npm",
+                package=pkg,
+                seq=seq,
+                error=traceback.format_exc(),
+            )
 
     log.info("[npm] %d new watchlist releases to process", len(releases))
+    write_activity_event(
+        "poll_run_completed",
+        ecosystem="npm",
+        mode="once",
+        start_seq=estimated_start,
+        end_seq=current_seq,
+        fetched_change_count=total_fetched,
+        changed_package_count=len(changed_packages),
+        release_count=len(releases),
+    )
 
     for pkg, version in releases:
         rank = watchlist.get(pkg.lower(), 0)
@@ -955,6 +1224,22 @@ def main():
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    log.info("Runtime log file: %s", LOG_FILE)
+    log.info("Structured activity log: %s", ACTIVITY_LOG_FILE)
+    write_activity_event(
+        "monitor_started",
+        log_file=str(LOG_FILE),
+        activity_log_file=str(ACTIVITY_LOG_FILE),
+        llm_backend=args.llm_backend,
+        model=args.model or "default",
+        once=args.once,
+        interval_seconds=args.interval,
+        top=args.top,
+        no_pypi=args.no_pypi,
+        no_npm=args.no_npm,
+        npm_top=args.npm_top,
+    )
 
     enable_pypi = not args.no_pypi
     enable_npm = not args.no_npm

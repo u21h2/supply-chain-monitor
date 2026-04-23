@@ -158,7 +158,7 @@ python monitor.py --no-npm
 | `slack.py` | Slack API client (SendMessage, PostFile) |
 | `etc/slack.json` | Slack bot credentials |
 | `last_serial.yaml` | Persisted polling state (PyPI serial + npm sequence/epoch) |
-| `logs/` | Daily log files (`monitor_YYYYMMDD.log`) |
+| `logs/` | Daily runtime log plus structured activity log (`monitor_YYYYMMDD.log`, `activity_YYYYMMDD.jsonl`) |
 
 ## Usage Details
 
@@ -189,7 +189,7 @@ npm options:
 PyPI and npm each run in their own polling thread. Polling state (PyPI serial, npm sequence + epoch) is persisted to `last_serial.yaml` so the monitor resumes where it left off after a restart.
 
 **PyPI pipeline:**
-1. Loads the top N packages from the [hugovk/top-pypi-packages](https://hugovk.github.io/top-pypi-packages/) dataset as a watchlist
+1. Loads the top N packages from the [hugovk/top-pypi-packages](https://hugovk.dev/top-pypi-packages/) dataset as a watchlist
 2. Connects to PyPI's XML-RPC API and gets the current serial number
 3. Every `--interval` seconds, calls `changelog_since_serial()` — a single API call that returns all events since the last check
 4. Filters for `"new release"` events matching the watchlist
@@ -202,7 +202,7 @@ PyPI and npm each run in their own polling thread. Polling state (PyPI serial, n
 4. Filters changed packages against the watchlist and checks for versions published after the last poll epoch
 5. For each new release: downloads old + new tarballs from the npm registry, diffs, analyzes via LLM, and alerts Slack if malicious
 
-All output is logged to both the console and `logs/monitor_YYYYMMDD.log`.
+All output is logged to both the console and `logs/monitor_YYYYMMDD.log`. In addition, the monitor writes structured JSONL activity records to `logs/activity_YYYYMMDD.jsonl`, including loop start/completion, package analysis start, verdicts, and errors.
 
 ### package_diff.py — Package Differ
 
@@ -276,7 +276,7 @@ packages = fetch_top_packages(top_n=500)
 
 | Source | What | Rate Limits |
 |--------|------|-------------|
-| [hugovk/top-pypi-packages](https://hugovk.github.io/top-pypi-packages/) | Top 15,000 PyPI packages by 30-day downloads (monthly JSON) | None (static file) |
+| [hugovk/top-pypi-packages](https://hugovk.dev/top-pypi-packages/) | Top 15,000 PyPI packages by monthly downloads (monthly JSON) | None (static file) |
 | [PyPI XML-RPC](https://warehouse.pypa.io/api-reference/xml-rpc.html) `changelog_since_serial()` | Real-time PyPI event firehose | Deprecated but functional; 1 call per poll is fine |
 | [PyPI JSON API](https://warehouse.pypa.io/api-reference/json.html) | Package metadata, version history, download URLs | Generous; used sparingly (1 call per release) |
 | [download-counts](https://www.npmjs.com/package/download-counts) (nice-registry) | Monthly download counts for every npm package (`counts.json`) | None (npm tarball) |
@@ -329,7 +329,11 @@ Analysis summary (truncated):
 
 ## Logging
 
-Logs are written to both stdout and `logs/monitor_YYYYMMDD.log`. A new file is created each day. Both ecosystems log to the same file, with npm lines prefixed `[npm]`. Example:
+Logs are written to both stdout and `logs/monitor_YYYYMMDD.log`. A new file is created each day. Both ecosystems log to the same file, with npm lines prefixed `[npm]`.
+
+The monitor also writes structured JSONL events to `logs/activity_YYYYMMDD.jsonl`. This file is intended for audit trails and downstream processing. Each line is a JSON object with a UTC timestamp, event type, ecosystem, and event-specific fields such as package name, version, verdict, and analysis excerpt.
+
+Runtime log example:
 
 ```
 2026-03-27 12:01:15 [INFO] Fetching top 15,000 packages from hugovk dataset...
@@ -348,6 +352,15 @@ Logs are written to both stdout and `logs/monitor_YYYYMMDD.log`. A new file is c
 2026-03-27 12:06:21 [INFO] [npm] Diffing axios 0.30.3 -> 0.30.4
 2026-03-27 12:07:01 [INFO] [npm] Analyzing diff for axios...
 2026-03-27 12:07:45 [INFO] [npm] Verdict for axios 0.30.4: MALICIOUS
+```
+
+Structured activity log example:
+
+```json
+{"event":"monitor_started","activity_log_file":"logs/activity_20260423.jsonl","llm_backend":"openai","ts":"2026-04-23T12:01:15+00:00"}
+{"event":"poll_run_started","ecosystem":"pypi","mode":"once","start_serial":36382101,"end_serial":36391101,"ts":"2026-04-23T12:22:07+00:00"}
+{"event":"analysis_started","ecosystem":"npm","package":"axios","old_version":"0.30.3","version":"0.30.4","backend":"openai","model":"gpt-4.1-mini","ts":"2026-04-23T12:07:01+00:00"}
+{"event":"analysis_completed","ecosystem":"npm","package":"axios","old_version":"0.30.3","version":"0.30.4","verdict":"malicious","analysis":"Verdict: malicious\nSuspicious dependency and obfuscated loader added.","ts":"2026-04-23T12:07:45+00:00"}
 ```
 
 ## Contributing, community, and license
