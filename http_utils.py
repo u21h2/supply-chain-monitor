@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,21 @@ from typing import Any
 import requests  # type: ignore[import-untyped]
 
 
+def _env_debug_enabled() -> bool:
+    return os.getenv("SCM_NETWORK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+_http_debug = _env_debug_enabled()
+
+
+def set_http_debug(enabled: bool) -> None:
+    global _http_debug
+    _http_debug = enabled
+
+
 def _print_http(message: str) -> None:
+    if not _http_debug:
+        return
     print(f"[http] {message}", flush=True)
 
 

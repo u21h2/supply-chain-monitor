@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import cast
 
 from analyze_diff import parse_verdict, run_diff_analysis
-from http_utils import download_file, get_json
+from http_utils import download_file, get_json, set_http_debug
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -51,7 +51,7 @@ from package_diff import (
     _label_from_archive,
 )
 from slack import Slack
-from xmlrpc_utils import build_server_proxy
+from xmlrpc_utils import build_server_proxy, set_xmlrpc_debug
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -1218,6 +1218,8 @@ def main():
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        set_http_debug(True)
+        set_xmlrpc_debug(True)
 
     log.info("Runtime log file: %s", LOG_FILE)
     log.info("Structured activity log: %s", ACTIVITY_LOG_FILE)

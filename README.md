@@ -177,7 +177,7 @@ Options:
   --slack          Enable Slack alerts for malicious findings
   --llm-backend    LLM backend for diff analysis (default: openai)
   --model MODEL    Override LLM model for the selected backend
-  --debug          Enable DEBUG logging (includes agent raw output)
+  --debug          Enable DEBUG logging and network request diagnostics
 
 PyPI options:
   --no-pypi        Disable PyPI monitoring
@@ -245,7 +245,7 @@ python analyze_diff.py telnyx_diff.md --model gpt-4.1-mini
 python analyze_diff.py telnyx_diff.md --backend cursor --model claude-4-opus
 ```
 
-By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode. Large diffs are truncated by `SCM_DIFF_CHAR_LIMIT` before the request is built, and OpenAI-compatible calls retry failed attempts up to `SCM_LLM_MAX_ATTEMPTS` times.
+By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode. Large diffs are truncated by `SCM_DIFF_CHAR_LIMIT` before the request is built, and OpenAI-compatible calls retry failed attempts up to `SCM_LLM_MAX_ATTEMPTS` times. Network diagnostics such as `[http] <- 200` and `[xmlrpc] <- ...` are printed only when `--debug` is set, or when `SCM_NETWORK_DEBUG=1` is exported for helper scripts.
 
 Exit codes: `0` = benign, `1` = malicious, `2` = unknown/error.
 

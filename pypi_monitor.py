@@ -24,8 +24,8 @@ import xmlrpc.client
 from datetime import datetime, timezone
 from typing import cast
 
-from http_utils import get_json
-from xmlrpc_utils import build_server_proxy
+from http_utils import get_json, set_http_debug
+from xmlrpc_utils import build_server_proxy, set_xmlrpc_debug
 
 PYPI_XMLRPC = "https://pypi.org/pypi"
 TOP_PACKAGES_URL = (
@@ -146,7 +146,12 @@ def main():
     parser.add_argument("--top", type=int, default=1000, help="Number of top packages to watch (default: 1000)")
     parser.add_argument("--interval", type=int, default=120, help="Poll interval in seconds (default: 120)")
     parser.add_argument("--once", action="store_true", help="Single check (last ~10 min), then exit")
+    parser.add_argument("--debug", action="store_true", help="Print network request diagnostics")
     args = parser.parse_args()
+
+    if args.debug:
+        set_http_debug(True)
+        set_xmlrpc_debug(True)
 
     watchlist = load_watchlist(args.top)
     client = get_client()

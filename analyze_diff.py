@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from http_utils import request as http_request
+from http_utils import request as http_request, set_http_debug
 
 log = logging.getLogger("monitor.analyze")
 
@@ -433,7 +433,11 @@ def main() -> None:
         dest="json_output",
         help="Output as JSON",
     )
+    parser.add_argument("--debug", action="store_true", help="Print network request diagnostics")
     args = parser.parse_args()
+
+    if args.debug:
+        set_http_debug(True)
 
     if not args.diff_file.exists():
         parser.error(f"File not found: {args.diff_file}")
