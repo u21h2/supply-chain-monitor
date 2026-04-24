@@ -18,7 +18,8 @@ Usage:
     python monitor.py --interval 120           # poll every 2 min
     python monitor.py --once                    # one-shot scan (no Slack by default)
     python monitor.py --slack                    # continuous, with Slack alerts
-    python monitor.py --llm-backend cursor      # use Cursor instead of OpenAI-compatible API
+    python monitor.py --llm-config etc/llm.json  # use ordered LLM provider fallback
+    python monitor.py --llm-backend cursor      # force Cursor instead of config/default
     python monitor.py --no-npm                 # PyPI only
     python monitor.py --no-pypi               # npm only
     python monitor.py --no-pypi --npm-top 5000 # npm only, top 5000
@@ -286,6 +287,7 @@ def analyze_report(
     *,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ) -> tuple[str, str]:
     """Write report to a temp workspace, run the analyzer, return (verdict, analysis)."""
     safe_name = package.replace("/", "_").replace("@", "")
@@ -294,7 +296,12 @@ def analyze_report(
     diff_file.write_text(report, encoding="utf-8")
     log.info("Diff written to %s", diff_file)
     try:
-        raw_output = run_diff_analysis(diff_file, backend=backend, model=model)
+        raw_output = run_diff_analysis(
+            diff_file,
+            backend=backend,
+            model=model,
+            llm_config=llm_config,
+        )
         verdict, analysis = parse_verdict(raw_output)
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
@@ -551,6 +558,7 @@ def process_npm_release(
     *,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
     log.info("[npm] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -598,8 +606,9 @@ def process_npm_release(
             old_version=old_version,
             version=new_version,
             rank=rank,
-            backend=backend or "default",
+            backend=backend or "config/default",
             model=model or "default",
+            llm_config=str(llm_config) if llm_config else "default",
         )
         verdict, analysis = analyze_report(
             report,
@@ -607,6 +616,7 @@ def process_npm_release(
             new_version,
             backend=backend,
             model=model,
+            llm_config=llm_config,
         )
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
         write_activity_event(
@@ -616,8 +626,9 @@ def process_npm_release(
             old_version=old_version,
             version=new_version,
             rank=rank,
-            backend=backend or "default",
+            backend=backend or "config/default",
             model=model or "default",
+            llm_config=str(llm_config) if llm_config else "default",
             verdict=verdict,
             analysis=_analysis_excerpt(analysis),
         )
@@ -664,6 +675,7 @@ def process_release(
     *,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
     log.info("[pypi] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -711,8 +723,9 @@ def process_release(
             old_version=old_version,
             version=new_version,
             rank=rank,
-            backend=backend or "default",
+            backend=backend or "config/default",
             model=model or "default",
+            llm_config=str(llm_config) if llm_config else "default",
         )
         verdict, analysis = analyze_report(
             report,
@@ -720,6 +733,7 @@ def process_release(
             new_version,
             backend=backend,
             model=model,
+            llm_config=llm_config,
         )
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
         write_activity_event(
@@ -729,8 +743,9 @@ def process_release(
             old_version=old_version,
             version=new_version,
             rank=rank,
-            backend=backend or "default",
+            backend=backend or "config/default",
             model=model or "default",
+            llm_config=str(llm_config) if llm_config else "default",
             verdict=verdict,
             analysis=_analysis_excerpt(analysis),
         )
@@ -753,6 +768,7 @@ def poll_loop(
     state_path: Path | None = None,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ):
     state_path = state_path or LAST_SERIAL_PATH
     client = build_server_proxy(PYPI_XMLRPC)
@@ -784,8 +800,9 @@ def poll_loop(
         mode="continuous",
         interval_seconds=interval,
         serial=serial,
-        backend=backend or "default",
+        backend=backend or "config/default",
         model=model or "default",
+        llm_config=str(llm_config) if llm_config else "default",
     )
 
     stats = {"checked": 0, "benign": 0, "malicious": 0, "error": 0, "skipped": 0}
@@ -852,6 +869,7 @@ def poll_loop(
                     slack=slack,
                     backend=backend,
                     model=model,
+                    llm_config=llm_config,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -880,6 +898,7 @@ def run_once(
     since_serial: int | None = None,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ):
     client = build_server_proxy(PYPI_XMLRPC)
     current_serial = _pypi_last_serial(client)
@@ -900,8 +919,9 @@ def run_once(
         start_serial=estimated_start,
         end_serial=current_serial,
         lookback_seconds=lookback_seconds,
-        backend=backend or "default",
+        backend=backend or "config/default",
         model=model or "default",
+        llm_config=str(llm_config) if llm_config else "default",
     )
 
     events = _pypi_events_since(client, estimated_start)
@@ -939,6 +959,7 @@ def run_once(
             slack=slack,
             backend=backend,
             model=model,
+            llm_config=llm_config,
         )
 
 
@@ -955,6 +976,7 @@ def npm_poll_loop(
     state_path: Path | None = None,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ):
     state_path = state_path or LAST_SERIAL_PATH
 
@@ -996,8 +1018,9 @@ def npm_poll_loop(
         interval_seconds=interval,
         seq=seq,
         poll_epoch=poll_epoch,
-        backend=backend or "default",
+        backend=backend or "config/default",
         model=model or "default",
+        llm_config=str(llm_config) if llm_config else "default",
     )
     stats = {"checked": 0, "benign": 0, "malicious": 0, "error": 0, "skipped": 0}
 
@@ -1080,6 +1103,7 @@ def npm_poll_loop(
                     slack=slack,
                     backend=backend,
                     model=model,
+                    llm_config=llm_config,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -1107,6 +1131,7 @@ def npm_run_once(
     *,
     backend: str | None = None,
     model: str | None = None,
+    llm_config: str | Path | None = None,
 ):
     """One-shot: check for npm releases published in the last *lookback_seconds*."""
     cutoff_epoch = time.time() - lookback_seconds
@@ -1124,8 +1149,9 @@ def npm_run_once(
         start_seq=estimated_start,
         end_seq=current_seq,
         lookback_seconds=lookback_seconds,
-        backend=backend or "default",
+        backend=backend or "config/default",
         model=model or "default",
+        llm_config=str(llm_config) if llm_config else "default",
     )
 
     changed_packages: set[str] = set()
@@ -1180,6 +1206,7 @@ def npm_run_once(
             slack=slack,
             backend=backend,
             model=model,
+            llm_config=llm_config,
         )
 
 
@@ -1196,10 +1223,15 @@ def main():
     parser.add_argument(
         "--llm-backend",
         choices=("openai", "cursor"),
-        default="openai",
-        help="LLM backend for diff analysis (default: openai)",
+        default=None,
+        help="Force one LLM backend instead of using etc/llm.json",
     )
     parser.add_argument("--model", help="Override model for the selected LLM backend")
+    parser.add_argument(
+        "--llm-config",
+        type=Path,
+        help="LLM provider config file (default: etc/llm.json if present)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes agent raw output)")
 
     pypi_group = parser.add_argument_group("PyPI options")
@@ -1227,8 +1259,9 @@ def main():
         "monitor_started",
         log_file=str(LOG_FILE),
         activity_log_file=str(ACTIVITY_LOG_FILE),
-        llm_backend=args.llm_backend,
+        llm_backend=args.llm_backend or "config/default",
         model=args.model or "default",
+        llm_config=str(args.llm_config) if args.llm_config else "default",
         once=args.once,
         interval_seconds=args.interval,
         top=args.top,
@@ -1252,6 +1285,7 @@ def main():
                 since_serial=args.serial,
                 backend=args.llm_backend,
                 model=args.model,
+                llm_config=args.llm_config,
             )
         if enable_npm:
             npm_top = args.npm_top or args.top
@@ -1261,6 +1295,7 @@ def main():
                 slack=args.slack,
                 backend=args.llm_backend,
                 model=args.model,
+                llm_config=args.llm_config,
             )
     else:
         threads: list[threading.Thread] = []
@@ -1275,6 +1310,7 @@ def main():
                     "initial_serial": args.serial,
                     "backend": args.llm_backend,
                     "model": args.model,
+                    "llm_config": args.llm_config,
                 },
                 daemon=True,
                 name="pypi-poll",
@@ -1292,6 +1328,7 @@ def main():
                     "initial_seq": args.npm_seq,
                     "backend": args.llm_backend,
                     "model": args.model,
+                    "llm_config": args.llm_config,
                 },
                 daemon=True,
                 name="npm-poll",

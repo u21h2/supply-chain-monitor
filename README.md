@@ -39,7 +39,7 @@ Each ecosystem runs its own polling thread but shares the analysis and alerting 
                                    └───────┬───────┘
                                            ▼
                                    ┌───────────────┐  ◄── LLM analysis
-                                   │ OpenAI-compat │      (default)
+                                   │ LLM providers │      (default)
                                    │ or Cursor CLI │
                                    └───────┬───────┘
                                            │
@@ -68,30 +68,41 @@ The LLM analysis is prompted to look for:
 
 - **Python 3.9+** — install runtime dependencies with `pip install -r requirements.txt` (stdlib covers most of the tool; `requests` is used for Slack uploads)
 - **An LLM backend**
-  - Default: an OpenAI-compatible Chat Completions API
+  - Default: one or more OpenAI-compatible Chat Completions providers in `etc/llm.json`
   - Optional: [Cursor Agent CLI](https://cursor.com/docs/cli/overview)
 
 ### OpenAI-Compatible Configuration
 
-Set these environment variables before running the monitor:
+Create `etc/llm.json` from `etc/llm.example.json` and list providers in fallback order:
 
-```bash
-export OPENAI_API_KEY="sk-..."
-export OPENAI_MODEL="gpt-4.1-mini"
-# Optional when using a non-OpenAI provider or local gateway:
-export OPENAI_BASE_URL="https://your-endpoint.example/v1"
-# Optional request sizing / retry controls:
-export SCM_DIFF_CHAR_LIMIT=300000
-export SCM_LLM_MAX_ATTEMPTS=3
+```json
+{
+  "providers": [
+    {
+      "name": "primary",
+      "backend": "openai",
+      "base_url": "https://df.dawnloadai.com:8443/v1",
+      "api_key": "sk-...",
+      "model": "MiniMax-M2.7-highspeed",
+      "max_attempts": 3
+    },
+    {
+      "name": "backup",
+      "backend": "openai",
+      "base_url": "https://your-backup-endpoint.example/v1",
+      "api_key": "sk-...",
+      "model": "backup-model",
+      "max_attempts": 3
+    }
+  ]
+}
 ```
 
-Supported aliases:
+The monitor tries providers from top to bottom. Each provider gets up to `max_attempts` tries before the next provider is used. `etc/llm.json` is ignored by git because it contains credentials.
 
-- `SCM_OPENAI_API_KEY`
-- `SCM_OPENAI_MODEL`
-- `SCM_OPENAI_BASE_URL`
+You can pass a different file with `--llm-config /path/to/llm.json`. If no config file exists, the legacy environment variables still work as a fallback: `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL`, and their `SCM_OPENAI_*` aliases.
 
-If `OPENAI_BASE_URL` is omitted, the tool uses `https://api.openai.com/v1`. `SCM_DIFF_CHAR_LIMIT` is a character-count request guard, not an exact model token context limit. The default OpenAI-compatible backend retries failed LLM calls up to `SCM_LLM_MAX_ATTEMPTS` times; the default is `3`.
+`SCM_DIFF_CHAR_LIMIT` remains available as a character-count request guard. It is not an exact model token context limit.
 
 ### Installing Cursor Agent CLI (Optional)
 
@@ -129,9 +140,9 @@ The bot needs `chat:write` scope on the target channel. The `channel` field is t
 ## Quick Start
 
 ```bash
-# Configure the default OpenAI-compatible backend
-export OPENAI_API_KEY="sk-..."
-export OPENAI_MODEL="gpt-4.1-mini"
+# Configure ordered OpenAI-compatible provider fallback
+cp etc/llm.example.json etc/llm.json
+# Edit etc/llm.json with your base_url, api_key, model, and max_attempts.
 
 # One-shot: analyze releases from the last ~10 minutes
 python monitor.py --once
@@ -159,6 +170,7 @@ python monitor.py --no-npm
 | `analyze_diff.py` | Send a diff to the selected LLM backend, parse verdict |
 | `top_pypi_packages.py` | Fetch and list top N PyPI packages by download count |
 | `slack.py` | Slack API client (SendMessage, PostFile) |
+| `etc/llm.example.json` | Example ordered LLM provider fallback config |
 | `etc/slack.json` | Slack bot credentials |
 | `last_serial.yaml` | Persisted polling state (PyPI serial + npm sequence/epoch) |
 | `logs/` | Daily runtime log plus structured activity log (`monitor_YYYYMMDD.log`, `activity_YYYYMMDD.jsonl`) |
@@ -175,7 +187,8 @@ Options:
   --interval SECS  Poll interval in seconds (default: 300)
   --once           Single pass over recent events, then exit
   --slack          Enable Slack alerts for malicious findings
-  --llm-backend    LLM backend for diff analysis (default: openai)
+  --llm-config     LLM provider config file (default: etc/llm.json if present)
+  --llm-backend    Force one LLM backend instead of using etc/llm.json
   --model MODEL    Override LLM model for the selected backend
   --debug          Enable DEBUG logging and network request diagnostics
 
@@ -245,7 +258,7 @@ python analyze_diff.py telnyx_diff.md --model gpt-4.1-mini
 python analyze_diff.py telnyx_diff.md --backend cursor --model claude-4-opus
 ```
 
-By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode. Large diffs are truncated by `SCM_DIFF_CHAR_LIMIT` before the request is built, and OpenAI-compatible calls retry failed attempts up to `SCM_LLM_MAX_ATTEMPTS` times. Network diagnostics such as `[http] <- 200` and `[xmlrpc] <- ...` are printed only when `--debug` is set, or when `SCM_NETWORK_DEBUG=1` is exported for helper scripts.
+By default this sends the diff contents to the ordered providers in `etc/llm.json` and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode. Large diffs are truncated by `SCM_DIFF_CHAR_LIMIT` before the request is built. Network diagnostics such as `[http] <- 200` and `[xmlrpc] <- ...` are printed only when `--debug` is set, or when `SCM_NETWORK_DEBUG=1` is exported for helper scripts.
 
 Exit codes: `0` = benign, `1` = malicious, `2` = unknown/error.
 
@@ -324,7 +337,7 @@ Analysis summary (truncated):
 ## Limitations
 
 - Releases are analyzed sequentially within each ecosystem thread. During high release volume, there will be a processing backlog.
-- **LLM access required** — the default backend needs a reachable OpenAI-compatible endpoint and valid credentials. Cursor is optional, not required.
+- **LLM access required** — configured providers in `etc/llm.json` need reachable OpenAI-compatible endpoints and valid credentials. Cursor is optional, not required.
 - **Large diffs may be truncated** before being sent to an OpenAI-compatible API. Adjust `SCM_DIFF_CHAR_LIMIT` if your model supports larger contexts; this is character-based, not token-based.
 - **Cursor sandbox mode** (filesystem isolation) is only available on macOS/Linux. On Windows, the agent runs in read-only `ask` mode but without OS-level sandboxing.
 - **Watchlists are static** — loaded once at startup from the hugovk (PyPI) and download-counts (npm) datasets. Restart to refresh.
@@ -360,9 +373,9 @@ Runtime log example:
 Structured activity log example:
 
 ```json
-{"event":"monitor_started","activity_log_file":"logs/activity_20260423.jsonl","llm_backend":"openai","ts":"2026-04-23T12:01:15+00:00"}
+{"event":"monitor_started","activity_log_file":"logs/activity_20260423.jsonl","llm_backend":"config/default","ts":"2026-04-23T12:01:15+00:00"}
 {"event":"poll_run_started","ecosystem":"pypi","mode":"once","start_serial":36382101,"end_serial":36391101,"ts":"2026-04-23T12:22:07+00:00"}
-{"event":"analysis_started","ecosystem":"npm","package":"axios","old_version":"0.30.3","version":"0.30.4","backend":"openai","model":"gpt-4.1-mini","ts":"2026-04-23T12:07:01+00:00"}
+{"event":"analysis_started","ecosystem":"npm","package":"axios","old_version":"0.30.3","version":"0.30.4","backend":"config/default","model":"default","ts":"2026-04-23T12:07:01+00:00"}
 {"event":"analysis_completed","ecosystem":"npm","package":"axios","old_version":"0.30.3","version":"0.30.4","verdict":"malicious","analysis":"Verdict: malicious\nSuspicious dependency and obfuscated loader added.","ts":"2026-04-23T12:07:45+00:00"}
 ```
 

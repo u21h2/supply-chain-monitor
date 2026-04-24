@@ -1,0 +1,20 @@
+{
+  "providers": [
+    {
+      "name": "primary",
+      "backend": "openai",
+      "base_url": "https://your-primary-endpoint.example/v1",
+      "api_key": "replace-with-primary-api-key",
+      "model": "your-primary-model",
+      "max_attempts": 3
+    },
+    {
+      "name": "backup",
+      "backend": "openai",
+      "base_url": "https://your-backup-endpoint.example/v1",
+      "api_key": "replace-with-backup-api-key",
+      "model": "your-backup-model",
+      "max_attempts": 3
+    }
+  ]
+}

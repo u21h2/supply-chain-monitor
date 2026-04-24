@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -93,7 +94,7 @@ class AnalyzeDiffTests(unittest.TestCase):
                     },
                     clear=False,
                 ):
-                    output = analyze_diff.run_diff_analysis(diff_file)
+                    output = analyze_diff.run_diff_analysis(diff_file, backend="openai")
 
         verdict, _ = analyze_diff.parse_verdict(output)
         self.assertEqual(verdict, "malicious")
@@ -159,6 +160,122 @@ class AnalyzeDiffTests(unittest.TestCase):
 
         self.assertEqual(http_request.call_count, 2)
         sleep.assert_called_once_with(1)
+
+    def test_llm_config_falls_back_to_next_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            diff_file = tmp_path / "config_diff.md"
+            diff_file.write_text("# Diff Report\n\n+console.log('ok')\n", encoding="utf-8")
+            config_file = tmp_path / "llm.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "providers": [
+                            {
+                                "name": "primary",
+                                "backend": "openai",
+                                "base_url": "http://primary-llm.local/v1",
+                                "api_key": "primary-key",
+                                "model": "primary-model",
+                                "max_attempts": 2,
+                            },
+                            {
+                                "name": "backup",
+                                "backend": "openai",
+                                "base_url": "http://backup-llm.local/v1",
+                                "api_key": "backup-key",
+                                "model": "backup-model",
+                                "max_attempts": 3,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.side_effect = [
+                    RuntimeError("primary down"),
+                    RuntimeError("primary still down"),
+                    _FakeResponse(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "Verdict: benign\nBackup worked.",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ]
+                with mock.patch("analyze_diff.time.sleep"):
+                    output = analyze_diff.run_diff_analysis(
+                        diff_file,
+                        llm_config=config_file,
+                    )
+
+        self.assertEqual(output, "Verdict: benign\nBackup worked.")
+        self.assertEqual(http_request.call_count, 3)
+        self.assertEqual(
+            http_request.call_args_list[0].args[1],
+            "http://primary-llm.local/v1/chat/completions",
+        )
+        self.assertEqual(
+            http_request.call_args_list[1].args[1],
+            "http://primary-llm.local/v1/chat/completions",
+        )
+        self.assertEqual(
+            http_request.call_args_list[2].args[1],
+            "http://backup-llm.local/v1/chat/completions",
+        )
+        self.assertEqual(
+            http_request.call_args_list[2].kwargs["json_body"]["model"],
+            "backup-model",
+        )
+        self.assertEqual(
+            http_request.call_args_list[2].kwargs["headers"]["Authorization"],
+            "Bearer backup-key",
+        )
+
+    def test_llm_config_reports_all_provider_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            diff_file = tmp_path / "all_fail_diff.md"
+            diff_file.write_text("# Diff Report\n\n+console.log('fail')\n", encoding="utf-8")
+            config_file = tmp_path / "llm.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "providers": [
+                            {
+                                "name": "primary",
+                                "backend": "openai",
+                                "base_url": "http://primary-llm.local/v1",
+                                "api_key": "primary-key",
+                                "model": "primary-model",
+                                "max_attempts": 1,
+                            },
+                            {
+                                "name": "backup",
+                                "backend": "openai",
+                                "base_url": "http://backup-llm.local/v1",
+                                "api_key": "backup-key",
+                                "model": "backup-model",
+                                "max_attempts": 1,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.side_effect = RuntimeError("provider down")
+                with self.assertRaisesRegex(RuntimeError, "All configured LLM providers"):
+                    analyze_diff.run_diff_analysis(diff_file, llm_config=config_file)
+
+        self.assertEqual(http_request.call_count, 2)
 
     def test_default_openai_endpoint_requires_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

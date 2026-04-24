@@ -4,13 +4,14 @@
 """
 Analyze a package diff report for supply chain compromise using an LLM backend.
 
-Defaults to an OpenAI-compatible Chat Completions API, with Cursor Agent CLI
-available as an optional backend.
+Defaults to ordered providers in etc/llm.json when present, with Cursor Agent
+CLI available as an optional backend.
 
 Usage:
     python analyze_diff.py <diff_file>
     python analyze_diff.py telnyx_diff.md
     python analyze_diff.py telnyx_diff.md --model gpt-4.1-mini
+    python analyze_diff.py telnyx_diff.md --llm-config etc/llm.json
     python analyze_diff.py telnyx_diff.md --backend cursor --model claude-4-opus
     python analyze_diff.py telnyx_diff.md --json
 
@@ -21,6 +22,7 @@ Can also be chained with package_diff.py:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -44,6 +46,17 @@ DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_CURSOR_MODEL = "composer-2-fast"
 DEFAULT_DIFF_CHAR_LIMIT = 300000
 DEFAULT_LLM_MAX_ATTEMPTS = 3
+DEFAULT_LLM_CONFIG_PATH = Path(__file__).resolve().parent / "etc" / "llm.json"
+
+
+@dataclass(frozen=True)
+class LLMProvider:
+    name: str
+    backend: str
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    max_attempts: int = DEFAULT_LLM_MAX_ATTEMPTS
 
 INSTRUCTIONS_TEMPLATE = """\
 # Supply Chain Diff Review
@@ -125,11 +138,88 @@ def _llm_max_attempts() -> int:
         return DEFAULT_LLM_MAX_ATTEMPTS
 
 
+def _coerce_max_attempts(value: Any) -> int:
+    if value is None:
+        return DEFAULT_LLM_MAX_ATTEMPTS
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_MAX_ATTEMPTS
+
+
 def _normalize_backend(backend: str | None) -> str:
     resolved = (backend or _default_backend()).strip().lower()
     if resolved not in {OPENAI_BACKEND, CURSOR_BACKEND}:
         raise ValueError(f"Unsupported backend: {backend}")
     return resolved
+
+
+def _resolve_llm_config_path(config_path: str | Path | None = None) -> tuple[Path, bool]:
+    if config_path:
+        return Path(config_path), True
+
+    env_path = os.getenv("SCM_LLM_CONFIG")
+    if env_path:
+        return Path(env_path), True
+
+    return DEFAULT_LLM_CONFIG_PATH, False
+
+
+def _provider_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _providers_from_payload(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        providers = payload.get("providers", payload.get("llms"))
+        if isinstance(providers, list):
+            return providers
+    raise ValueError("LLM config must be a list or an object with a 'providers' list.")
+
+
+def load_llm_providers(config_path: str | Path | None = None) -> list[LLMProvider]:
+    path, explicit = _resolve_llm_config_path(config_path)
+    if not path.exists():
+        if explicit:
+            raise FileNotFoundError(f"LLM config file not found: {path}")
+        return []
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    providers: list[LLMProvider] = []
+    for index, item in enumerate(_providers_from_payload(payload), start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"LLM provider #{index} must be an object.")
+        if item.get("enabled", True) is False:
+            continue
+
+        backend = _normalize_backend(_provider_string(item.get("backend")) or OPENAI_BACKEND)
+        name = _provider_string(item.get("name")) or f"{backend}-{index}"
+        api_key = _provider_string(item.get("api_key"))
+        api_key_env = _provider_string(item.get("api_key_env"))
+        if not api_key and api_key_env:
+            api_key = os.getenv(api_key_env)
+
+        providers.append(
+            LLMProvider(
+                name=name,
+                backend=backend,
+                model=_provider_string(item.get("model")),
+                base_url=_provider_string(item.get("base_url")),
+                api_key=api_key,
+                max_attempts=_coerce_max_attempts(
+                    item.get("max_attempts", item.get("attempts"))
+                ),
+            )
+        )
+
+    if not providers:
+        raise ValueError(f"LLM config file has no enabled providers: {path}")
+    return providers
 
 
 def _find_agent() -> str:
@@ -250,6 +340,8 @@ def run_openai_compatible(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_attempts: int | None = None,
+    provider_name: str | None = None,
 ) -> str:
     resolved_model = model or _default_model(OPENAI_BACKEND)
     resolved_base_url = base_url or _default_openai_base_url()
@@ -277,21 +369,22 @@ def run_openai_compatible(
         "temperature": 0,
     }
     url = _chat_completions_url(resolved_base_url)
-    max_attempts = _llm_max_attempts()
+    attempt_limit = max(1, max_attempts or _llm_max_attempts())
     last_error: Exception | None = None
 
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, attempt_limit + 1):
         try:
             log.debug(
                 "POST %s with model=%s (attempt %d/%d)",
                 url,
                 resolved_model,
                 attempt,
-                max_attempts,
+                attempt_limit,
             )
+            provider_part = f", provider={provider_name}" if provider_name else ""
             print(
-                f"[*] LLM request attempt {attempt}/{max_attempts} "
-                f"(backend=openai, model={resolved_model})",
+                f"[*] LLM request attempt {attempt}/{attempt_limit} "
+                f"(backend=openai{provider_part}, model={resolved_model})",
                 file=sys.stderr,
             )
             response = http_request(
@@ -310,25 +403,25 @@ def run_openai_compatible(
             raise RuntimeError("OpenAI-compatible API returned no message content.")
         except Exception as exc:
             last_error = exc
-            if attempt >= max_attempts:
+            if attempt >= attempt_limit:
                 break
             wait_seconds = min(2 ** (attempt - 1), 8)
             log.warning(
                 "OpenAI-compatible request attempt %d/%d failed: %s; retrying in %ss",
                 attempt,
-                max_attempts,
+                attempt_limit,
                 exc,
                 wait_seconds,
             )
             print(
-                f"[*] LLM request attempt {attempt}/{max_attempts} failed: {exc}; "
+                f"[*] LLM request attempt {attempt}/{attempt_limit} failed: {exc}; "
                 f"retrying in {wait_seconds}s",
                 file=sys.stderr,
             )
             time.sleep(wait_seconds)
 
     raise RuntimeError(
-        f"OpenAI-compatible API failed after {max_attempts} attempt(s): {last_error}"
+        f"OpenAI-compatible API failed after {attempt_limit} attempt(s): {last_error}"
     )
 
 
@@ -375,6 +468,57 @@ def run_cursor_agent(diff_file: Path, model: str | None = None) -> str:
     return result.stdout or ""
 
 
+def _run_provider(diff_file: Path, provider: LLMProvider, model: str | None = None) -> str:
+    provider_model = model or provider.model
+    if provider.backend == CURSOR_BACKEND:
+        return run_cursor_agent(diff_file, model=provider_model)
+    return run_openai_compatible(
+        diff_file,
+        model=provider_model,
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        max_attempts=provider.max_attempts,
+        provider_name=provider.name,
+    )
+
+
+def run_configured_llm_providers(
+    diff_file: Path,
+    providers: list[LLMProvider],
+    *,
+    model: str | None = None,
+) -> str:
+    errors: list[str] = []
+    for index, provider in enumerate(providers, start=1):
+        log.info(
+            "Trying LLM provider %s/%s: %s (backend=%s, model=%s)",
+            index,
+            len(providers),
+            provider.name,
+            provider.backend,
+            model or provider.model or "default",
+        )
+        print(
+            f"[*] Trying LLM provider {index}/{len(providers)}: "
+            f"{provider.name} (backend={provider.backend}, model={model or provider.model or 'default'})",
+            file=sys.stderr,
+        )
+        try:
+            return _run_provider(diff_file, provider, model=model)
+        except Exception as exc:
+            errors.append(f"{provider.name}: {exc}")
+            if index < len(providers):
+                log.warning(
+                    "LLM provider %s failed; trying next provider: %s",
+                    provider.name,
+                    exc,
+                )
+            else:
+                log.error("LLM provider %s failed: %s", provider.name, exc)
+
+    raise RuntimeError("All configured LLM providers failed: " + " | ".join(errors))
+
+
 def run_diff_analysis(
     diff_file: Path,
     *,
@@ -382,7 +526,13 @@ def run_diff_analysis(
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    llm_config: str | Path | None = None,
 ) -> str:
+    if backend is None and base_url is None and api_key is None:
+        providers = load_llm_providers(llm_config)
+        if providers:
+            return run_configured_llm_providers(diff_file, providers, model=model)
+
     resolved_backend = _normalize_backend(backend)
     if resolved_backend == CURSOR_BACKEND:
         return run_cursor_agent(diff_file, model=model)
@@ -415,10 +565,15 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         choices=(OPENAI_BACKEND, CURSOR_BACKEND),
-        default=_default_backend(),
-        help=f"LLM backend to use (default: {_default_backend()})",
+        default=None,
+        help="Force a single LLM backend instead of using the config file",
     )
     parser.add_argument("--model", help="Model to use (backend-specific default if omitted)")
+    parser.add_argument(
+        "--llm-config",
+        type=Path,
+        help=f"LLM provider config file (default: {DEFAULT_LLM_CONFIG_PATH})",
+    )
     parser.add_argument(
         "--base-url",
         help="Base URL for the OpenAI-compatible API (defaults to OPENAI_BASE_URL)",
@@ -442,10 +597,8 @@ def main() -> None:
     if not args.diff_file.exists():
         parser.error(f"File not found: {args.diff_file}")
 
-    print(
-        f"[*] Analyzing {args.diff_file.name} with {args.backend} backend...",
-        file=sys.stderr,
-    )
+    target = f"{args.backend} backend" if args.backend else "configured LLM providers"
+    print(f"[*] Analyzing {args.diff_file.name} with {target}...", file=sys.stderr)
 
     raw_output = run_diff_analysis(
         args.diff_file,
@@ -453,6 +606,7 @@ def main() -> None:
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
+        llm_config=args.llm_config,
     )
     verdict, analysis = parse_verdict(raw_output)
 
@@ -461,7 +615,7 @@ def main() -> None:
             json.dumps(
                 {
                     "file": str(args.diff_file),
-                    "backend": args.backend,
+                    "backend": args.backend or "config",
                     "verdict": verdict,
                     "analysis": analysis,
                 },
@@ -471,7 +625,7 @@ def main() -> None:
     else:
         print(f"\n{'=' * 60}")
         print(f"  FILE:    {args.diff_file.name}")
-        print(f"  BACKEND: {args.backend}")
+        print(f"  BACKEND: {args.backend or 'config'}")
         print(f"  VERDICT: {verdict.upper()}")
         print(f"{'=' * 60}")
         print(f"\n{analysis}")

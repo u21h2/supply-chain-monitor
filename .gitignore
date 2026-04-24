@@ -23,6 +23,7 @@ last_serial.yaml
 
 # Secrets / config
 etc/slack.json
+etc/llm.json
 
 # Downloaded package artifacts
 analysis/*/
