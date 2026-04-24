@@ -29,10 +29,11 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-import requests  # type: ignore[import-untyped]
+from http_utils import request as http_request
 
 log = logging.getLogger("monitor.analyze")
 
@@ -42,6 +43,7 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_CURSOR_MODEL = "composer-2-fast"
 DEFAULT_DIFF_CHAR_LIMIT = 300000
+DEFAULT_LLM_MAX_ATTEMPTS = 3
 
 INSTRUCTIONS_TEMPLATE = """\
 # Supply Chain Diff Review
@@ -113,6 +115,14 @@ def _diff_char_limit() -> int:
         return max(0, int(raw_value or DEFAULT_DIFF_CHAR_LIMIT))
     except ValueError:
         return DEFAULT_DIFF_CHAR_LIMIT
+
+
+def _llm_max_attempts() -> int:
+    raw_value = _env("SCM_LLM_MAX_ATTEMPTS", default=str(DEFAULT_LLM_MAX_ATTEMPTS))
+    try:
+        return max(1, int(raw_value or DEFAULT_LLM_MAX_ATTEMPTS))
+    except ValueError:
+        return DEFAULT_LLM_MAX_ATTEMPTS
 
 
 def _normalize_backend(backend: str | None) -> str:
@@ -267,17 +277,59 @@ def run_openai_compatible(
         "temperature": 0,
     }
     url = _chat_completions_url(resolved_base_url)
+    max_attempts = _llm_max_attempts()
+    last_error: Exception | None = None
 
-    log.debug("POST %s with model=%s", url, resolved_model)
-    response = requests.post(url, headers=headers, json=payload, timeout=(10, 300))
-    log.debug("OpenAI-compatible status=%s", response.status_code)
-    response.raise_for_status()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.debug(
+                "POST %s with model=%s (attempt %d/%d)",
+                url,
+                resolved_model,
+                attempt,
+                max_attempts,
+            )
+            print(
+                f"[*] LLM request attempt {attempt}/{max_attempts} "
+                f"(backend=openai, model={resolved_model})",
+                file=sys.stderr,
+            )
+            response = http_request(
+                "POST",
+                url,
+                headers=headers,
+                json_body=payload,
+                timeout=(10, 300),
+            )
+            log.debug("OpenAI-compatible status=%s", response.status_code)
 
-    data = response.json()
-    output = _extract_chat_output(data)
-    if output:
-        return output
-    raise RuntimeError("OpenAI-compatible API returned no message content.")
+            data = response.json()
+            output = _extract_chat_output(data)
+            if output:
+                return output
+            raise RuntimeError("OpenAI-compatible API returned no message content.")
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            wait_seconds = min(2 ** (attempt - 1), 8)
+            log.warning(
+                "OpenAI-compatible request attempt %d/%d failed: %s; retrying in %ss",
+                attempt,
+                max_attempts,
+                exc,
+                wait_seconds,
+            )
+            print(
+                f"[*] LLM request attempt {attempt}/{max_attempts} failed: {exc}; "
+                f"retrying in {wait_seconds}s",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"OpenAI-compatible API failed after {max_attempts} attempt(s): {last_error}"
+    )
 
 
 def run_cursor_agent(diff_file: Path, model: str | None = None) -> str:

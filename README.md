@@ -80,6 +80,9 @@ export OPENAI_API_KEY="sk-..."
 export OPENAI_MODEL="gpt-4.1-mini"
 # Optional when using a non-OpenAI provider or local gateway:
 export OPENAI_BASE_URL="https://your-endpoint.example/v1"
+# Optional request sizing / retry controls:
+export SCM_DIFF_CHAR_LIMIT=300000
+export SCM_LLM_MAX_ATTEMPTS=3
 ```
 
 Supported aliases:
@@ -88,7 +91,7 @@ Supported aliases:
 - `SCM_OPENAI_MODEL`
 - `SCM_OPENAI_BASE_URL`
 
-If `OPENAI_BASE_URL` is omitted, the tool uses `https://api.openai.com/v1`.
+If `OPENAI_BASE_URL` is omitted, the tool uses `https://api.openai.com/v1`. `SCM_DIFF_CHAR_LIMIT` is a character-count request guard, not an exact model token context limit. The default OpenAI-compatible backend retries failed LLM calls up to `SCM_LLM_MAX_ATTEMPTS` times; the default is `3`.
 
 ### Installing Cursor Agent CLI (Optional)
 
@@ -242,7 +245,7 @@ python analyze_diff.py telnyx_diff.md --model gpt-4.1-mini
 python analyze_diff.py telnyx_diff.md --backend cursor --model claude-4-opus
 ```
 
-By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode.
+By default this sends the diff contents to an OpenAI-compatible `/v1/chat/completions` endpoint and expects a structured verdict. Cursor remains available via `--backend cursor`, which runs the local `agent` CLI in read-only `ask` mode. Large diffs are truncated by `SCM_DIFF_CHAR_LIMIT` before the request is built, and OpenAI-compatible calls retry failed attempts up to `SCM_LLM_MAX_ATTEMPTS` times.
 
 Exit codes: `0` = benign, `1` = malicious, `2` = unknown/error.
 
@@ -322,7 +325,7 @@ Analysis summary (truncated):
 
 - Releases are analyzed sequentially within each ecosystem thread. During high release volume, there will be a processing backlog.
 - **LLM access required** — the default backend needs a reachable OpenAI-compatible endpoint and valid credentials. Cursor is optional, not required.
-- **Large diffs may be truncated** before being sent to an OpenAI-compatible API. Adjust `SCM_DIFF_CHAR_LIMIT` if your model supports larger contexts.
+- **Large diffs may be truncated** before being sent to an OpenAI-compatible API. Adjust `SCM_DIFF_CHAR_LIMIT` if your model supports larger contexts; this is character-based, not token-based.
 - **Cursor sandbox mode** (filesystem isolation) is only available on macOS/Linux. On Windows, the agent runs in read-only `ask` mode but without OS-level sandboxing.
 - **Watchlists are static** — loaded once at startup from the hugovk (PyPI) and download-counts (npm) datasets. Restart to refresh.
 - **npm _changes gap protection** — if the saved npm sequence falls more than 10,000 changes behind the registry head, the monitor resets to head to avoid a long catch-up. Releases during the gap are missed.

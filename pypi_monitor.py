@@ -19,12 +19,13 @@ Usage:
 """
 
 import argparse
-import json
 import time
-import urllib.request
 import xmlrpc.client
 from datetime import datetime, timezone
 from typing import cast
+
+from http_utils import get_json
+from xmlrpc_utils import build_server_proxy
 
 PYPI_XMLRPC = "https://pypi.org/pypi"
 TOP_PACKAGES_URL = (
@@ -37,15 +38,14 @@ PyPIEvent = tuple[str, str, int, str, int]
 
 def load_watchlist(top_n: int) -> set[str]:
     print(f"[*] Fetching top {top_n:,} packages from hugovk dataset...")
-    with urllib.request.urlopen(TOP_PACKAGES_URL) as resp:
-        data = json.loads(resp.read())
+    data = get_json(TOP_PACKAGES_URL, timeout=30)
     names = {row["project"].lower() for row in data["rows"][:top_n]}
     print(f"[+] Watchlist loaded: {len(names):,} packages (dataset updated {data['last_update']})")
     return names
 
 
 def get_client() -> xmlrpc.client.ServerProxy:
-    return xmlrpc.client.ServerProxy(PYPI_XMLRPC)
+    return build_server_proxy(PYPI_XMLRPC)
 
 
 def _pypi_last_serial(client: xmlrpc.client.ServerProxy) -> int:

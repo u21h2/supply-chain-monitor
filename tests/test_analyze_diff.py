@@ -38,8 +38,8 @@ class AnalyzeDiffTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with mock.patch("analyze_diff.requests.post") as post:
-                post.return_value = _FakeResponse(
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.return_value = _FakeResponse(
                     {
                         "choices": [
                             {
@@ -59,20 +59,21 @@ class AnalyzeDiffTests(unittest.TestCase):
                 )
 
         self.assertEqual(output, "Verdict: benign\nLooks routine.")
-        post.assert_called_once()
-        args, kwargs = post.call_args
-        self.assertEqual(args[0], "http://mock-llm.local/v1/chat/completions")
+        http_request.assert_called_once()
+        args, kwargs = http_request.call_args
+        self.assertEqual(args[0], "POST")
+        self.assertEqual(args[1], "http://mock-llm.local/v1/chat/completions")
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-key")
-        self.assertEqual(kwargs["json"]["model"], "mock-model")
-        self.assertEqual(kwargs["json"]["messages"][0]["role"], "system")
+        self.assertEqual(kwargs["json_body"]["model"], "mock-model")
+        self.assertEqual(kwargs["json_body"]["messages"][0]["role"], "system")
 
     def test_openai_backend_uses_environment_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             diff_file = Path(tmpdir) / "env_diff.md"
             diff_file.write_text("# Diff Report\n\n+eval(payload)\n", encoding="utf-8")
 
-            with mock.patch("analyze_diff.requests.post") as post:
-                post.return_value = _FakeResponse(
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.return_value = _FakeResponse(
                     {
                         "choices": [
                             {
@@ -96,9 +97,68 @@ class AnalyzeDiffTests(unittest.TestCase):
 
         verdict, _ = analyze_diff.parse_verdict(output)
         self.assertEqual(verdict, "malicious")
-        args, kwargs = post.call_args
-        self.assertEqual(args[0], "http://env-llm.local/v1/chat/completions")
-        self.assertEqual(kwargs["json"]["model"], "env-model")
+        args, kwargs = http_request.call_args
+        self.assertEqual(args[0], "POST")
+        self.assertEqual(args[1], "http://env-llm.local/v1/chat/completions")
+        self.assertEqual(kwargs["json_body"]["model"], "env-model")
+
+    def test_openai_backend_retries_failed_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            diff_file = Path(tmpdir) / "retry_diff.md"
+            diff_file.write_text("# Diff Report\n\n+print('retry')\n", encoding="utf-8")
+
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.side_effect = [
+                    RuntimeError("temporary outage"),
+                    _FakeResponse(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "Verdict: benign\nRecovered.",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ]
+                with mock.patch("analyze_diff.time.sleep") as sleep:
+                    output = analyze_diff.run_diff_analysis(
+                        diff_file,
+                        backend="openai",
+                        model="mock-model",
+                        base_url="http://retry-llm.local",
+                        api_key="test-key",
+                    )
+
+        self.assertEqual(output, "Verdict: benign\nRecovered.")
+        self.assertEqual(http_request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_openai_backend_respects_retry_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            diff_file = Path(tmpdir) / "retry_limit_diff.md"
+            diff_file.write_text("# Diff Report\n\n+print('fail')\n", encoding="utf-8")
+
+            with mock.patch("analyze_diff.http_request") as http_request:
+                http_request.side_effect = RuntimeError("still down")
+                with mock.patch("analyze_diff.time.sleep") as sleep:
+                    with mock.patch.dict(
+                        os.environ,
+                        {"SCM_LLM_MAX_ATTEMPTS": "2"},
+                        clear=False,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "2 attempt"):
+                            analyze_diff.run_diff_analysis(
+                                diff_file,
+                                backend="openai",
+                                model="mock-model",
+                                base_url="http://retry-llm.local",
+                                api_key="test-key",
+                            )
+
+        self.assertEqual(http_request.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_default_openai_endpoint_requires_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

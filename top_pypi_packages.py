@@ -1,16 +1,14 @@
 # Copyright 2026 Elastic N.V.
 # Licensed under the MIT License. See LICENSE file in the project root for details.
 
-import json
-import urllib.request
+from http_utils import get_json
 
 URL = "https://hugovk.dev/top-pypi-packages/top-pypi-packages.min.json"
 TOP_N = 1000
 
 
 def fetch_top_packages(url: str = URL, top_n: int = TOP_N) -> list[dict]:
-    with urllib.request.urlopen(url) as resp:
-        data = json.loads(resp.read())
+    data = get_json(url, timeout=30)
 
     print(f"Last updated: {data['last_update']}")
     print(f"Total packages in dataset: {len(data['rows']):,}")

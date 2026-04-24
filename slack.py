@@ -7,9 +7,7 @@ import traceback
 import time
 import os
 
-import requests  # type: ignore[import-untyped]
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
+from http_utils import request as http_request
 
 logger = logging.getLogger(__name__)
 
@@ -32,29 +30,21 @@ class Slack:
 
     def UrlPOST(self, url, params):
         params["token"] = self.bot_token
-        p = urlencode(params)
-        p = p.encode("ascii")  # data should be bytes
-        req = Request(url, p)
         result = None
         try:
-            response = urlopen(req, timeout=60)
-            result = response.read()
-            #print(result)
+            response = http_request("POST", url, data=params, timeout=60)
+            result = response.content
         except Exception:
             logger.error("Error in POST %s" % traceback.format_exc())
         return result
 
     def BotPOST(self, url, params):
         params["token"] = self.bot_token
-        p = urlencode(params)
-        p = p.encode("ascii")  # data should be bytes
-        req = Request(url, p)
         result = None
         try:
-            response = urlopen(req, timeout=60)
-            result = response.read()
+            response = http_request("POST", url, data=params, timeout=60)
+            result = response.json()
             print(result)
-            result = json.loads(result)
         except Exception:
             logger.error("Error in POST %s" % traceback.format_exc())
         return result
@@ -62,14 +52,15 @@ class Slack:
     def POST(self, url, params):
         result = None
         print(params)
-        data = json.dumps(params)
-        data = data.encode("ascii")  # data should be bytes
-        req = Request(url, data)
-        # req.add_header('Content-Type', 'application/json')
-        req.add_header("Authorization", "Bearer " + self.bot_token)
         try:
-            response = urlopen(req, timeout=60)
-            result = json.loads(response.read())
+            response = http_request(
+                "POST",
+                url,
+                json_body=params,
+                headers={"Authorization": "Bearer " + self.bot_token},
+                timeout=60,
+            )
+            result = response.json()
         except Exception:
             logger.warning("POST failed to %s - %s" % (url, traceback.format_exc()))
 
@@ -80,13 +71,8 @@ class Slack:
 
     def GET(self, params=None):
         url = self.url
-        if params:
-            req = Request("%s?%s" % (url, urlencode(params)))
-        else:
-            req = Request(url)
-        response = urlopen(req, timeout=60)
-        result = json.loads(response.read())
-        return result
+        response = http_request("GET", url, params=params, timeout=60)
+        return response.json()
 
     def GenerateToken(self):
         url = "	https://slack.com/api/oauth.v2.access"
@@ -114,7 +100,6 @@ class Slack:
         resp = self.BotPOST(url, params)
         if not resp:
             return
-        resp = json.loads(resp)
         if not resp.get("ok"):
             logger.warning("Error in getUploadURLExternal")
             return
@@ -124,8 +109,12 @@ class Slack:
             f.write(content)
         with open(filename, "r", encoding="utf8") as f:
             try:
-                requests.post(
-                    upload_url, files={filename: f}, params={"token": self.bot_token}
+                http_request(
+                    "POST",
+                    upload_url,
+                    files={filename: f},
+                    params={"token": self.bot_token},
+                    timeout=60,
                 )
             except Exception:
                 logger.warning("Upload file failed: %s" % (traceback.format_exc()))

@@ -19,15 +19,15 @@ import argparse
 import difflib
 import hashlib
 import io
-import json
 import os
 import shutil
 import tarfile
 import tempfile
-import urllib.request
 import zipfile
 import zlib
 from pathlib import Path
+
+from http_utils import download_file, get_json
 
 PYPI_VERSION_URL = "https://pypi.org/pypi/{package}/{version}/json"
 NPM_REGISTRY_URL = "https://registry.npmjs.org"
@@ -60,8 +60,7 @@ def download_package(
     url = PYPI_VERSION_URL.format(package=package, version=version)
     print(f"Fetching metadata for {package}=={version}...")
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read())
+        data = get_json(url, timeout=30)
     except Exception as e:
         raise RuntimeError(f"Failed to fetch PyPI metadata for {package}=={version}: {e}")
 
@@ -87,7 +86,7 @@ def download_package(
     out_path = dest / filename
 
     print(f"Downloading {filename} ({chosen['packagetype']})...")
-    urllib.request.urlretrieve(download_url, out_path)
+    download_file(download_url, out_path, timeout=60)
     return out_path
 
 
@@ -102,8 +101,7 @@ def download_npm_package(package: str, version: str, dest: Path) -> Path:
     url = f"{NPM_REGISTRY_URL}/{encoded}/{version}"
     print(f"Fetching npm metadata for {package}@{version}...")
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read())
+        data = get_json(url, timeout=30)
     except Exception as e:
         raise RuntimeError(f"Failed to fetch npm metadata for {package}@{version}: {e}")
 
@@ -115,7 +113,7 @@ def download_npm_package(package: str, version: str, dest: Path) -> Path:
     out_path = dest / filename
 
     print(f"Downloading {filename}...")
-    urllib.request.urlretrieve(tarball_url, out_path)
+    download_file(tarball_url, out_path, timeout=60)
     return out_path
 
 

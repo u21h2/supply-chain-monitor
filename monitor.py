@@ -35,13 +35,13 @@ import threading
 import time
 import traceback
 import urllib.parse
-import urllib.request
 import xmlrpc.client
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 from analyze_diff import parse_verdict, run_diff_analysis
+from http_utils import download_file, get_json
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -51,6 +51,7 @@ from package_diff import (
     _label_from_archive,
 )
 from slack import Slack
+from xmlrpc_utils import build_server_proxy
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -144,8 +145,7 @@ def save_last_serial(serial: int, path: Path = LAST_SERIAL_PATH) -> None:
 def load_watchlist(top_n: int) -> dict[str, int]:
     """Return {package_name_lower: rank} for the top N packages."""
     log.info("Fetching top %s packages from hugovk dataset...", f"{top_n:,}")
-    with urllib.request.urlopen(TOP_PACKAGES_URL) as resp:
-        data = json.loads(resp.read())
+    data = get_json(TOP_PACKAGES_URL, timeout=30)
     watchlist = {}
     for i, row in enumerate(data["rows"][:top_n], 1):
         watchlist[row["project"].lower()] = i
@@ -193,8 +193,7 @@ def get_previous_version(package: str, new_version: str) -> str | None:
     """Query PyPI JSON API to find the version released just before `new_version`."""
     url = PYPI_JSON.format(package=package)
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read())
+        data = get_json(url, timeout=15)
     except Exception:
         log.warning("Failed to fetch version list for %s", package)
         return None
@@ -381,14 +380,13 @@ def load_npm_watchlist(top_n: int) -> dict[str, int]:
     tmp = Path(tempfile.mkdtemp(prefix="npm_watchlist_"))
     try:
         meta_url = f"{NPM_REGISTRY}/download-counts/latest"
-        with urllib.request.urlopen(meta_url, timeout=30) as resp:
-            meta = json.loads(resp.read())
+        meta = get_json(meta_url, timeout=30)
         tarball_url = meta["dist"]["tarball"]
         dataset_version = meta.get("version", "unknown")
 
         tarball_path = tmp / "download-counts.tgz"
         log.info("Downloading download-counts %s dataset...", dataset_version)
-        urllib.request.urlretrieve(tarball_url, tarball_path)
+        download_file(tarball_url, tarball_path, timeout=60)
 
         root = extract_archive(tarball_path, tmp / "ext")
         counts_file = root / "counts.json"
@@ -435,8 +433,7 @@ def _load_npm_watchlist_search(top_n: int) -> dict[str, int]:
         })
         url = f"{NPM_SEARCH}?{params}"
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                data = json.loads(resp.read())
+            data = get_json(url, timeout=30)
         except Exception:
             log.warning("npm search API failed at offset %d, stopping", offset)
             break
@@ -452,8 +449,7 @@ def _load_npm_watchlist_search(top_n: int) -> dict[str, int]:
 
 def npm_get_current_seq() -> int:
     """Get the current update_seq from the npm replication endpoint."""
-    with urllib.request.urlopen(NPM_REPLICATE, timeout=15) as resp:
-        data = json.loads(resp.read())
+    data = get_json(NPM_REPLICATE, timeout=15)
     return data["update_seq"]
 
 
@@ -463,8 +459,7 @@ def npm_poll_changes(since: int, limit: int = 500) -> tuple[list[dict], int]:
     Returns (results_list, last_seq).
     """
     url = f"{NPM_REPLICATE}/_changes?since={since}&limit={limit}"
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        data = json.loads(resp.read())
+    data = get_json(url, timeout=60)
     return data.get("results", []), data.get("last_seq", since)
 
 
@@ -473,8 +468,7 @@ def npm_get_package_info(package: str) -> dict | None:
     encoded = urllib.parse.quote(package, safe="@")
     url = f"{NPM_REGISTRY}/{encoded}"
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read())
+        return get_json(url, timeout=30)
     except Exception:
         log.warning("Failed to fetch npm info for %s", package)
         return None
@@ -761,7 +755,7 @@ def poll_loop(
     model: str | None = None,
 ):
     state_path = state_path or LAST_SERIAL_PATH
-    client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
+    client = build_server_proxy(PYPI_XMLRPC)
     if initial_serial is not None:
         serial = initial_serial
         log.info("[pypi] Starting serial: %s (from --serial) — polling every %ss", f"{serial:,}", interval)
@@ -887,7 +881,7 @@ def run_once(
     backend: str | None = None,
     model: str | None = None,
 ):
-    client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
+    client = build_server_proxy(PYPI_XMLRPC)
     current_serial = _pypi_last_serial(client)
     if since_serial is not None:
         estimated_start = max(0, since_serial)
